@@ -12,7 +12,6 @@ st.set_page_config(page_title="AI 權證全自動篩選器", page_icon="🎯", l
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except Exception:
-    # ⚠️ 若在本地端測試，請換成真實 API Key
     GEMINI_API_KEY = "請填入你的_API_KEY"
 # ============================================
 
@@ -24,19 +23,18 @@ if 'passed_warrants' not in st.session_state:
 # ============================================================
 
 def get_stock_and_ma20(code):
-    """抓取現股 20MA"""
+    """抓取現股 20MA (包含三重備援)"""
     try:
         hist = yf.Ticker(code + ".TW").history(period="3mo")
         if hist.empty: hist = yf.Ticker(code + ".TWO").history(period="3mo")
         if not hist.empty:
             hist['MA20'] = hist['Close'].rolling(window=20).mean()
             return round(hist['Close'].iloc[-1], 2), round(hist['MA20'].iloc[-1], 2)
-        return None, None
     except:
-        return None, None
+        pass
+    return None, None
 
 def calculate_days_left(date_str):
-    """將 '115年07月25日' 這種中文日期轉換並計算剩餘天數"""
     try:
         date_str = str(date_str).strip()
         match = re.search(r'(\d+)年(\d+)月(\d+)', date_str)
@@ -51,7 +49,6 @@ def calculate_days_left(date_str):
         return 0
 
 def ask_ai_top_3(warrants_list, stock_price, target_type):
-    """將過濾後的權證名單交給 Gemini AI 進行終極選美"""
     if GEMINI_API_KEY == "請填入你的_API_KEY":
         return "⚠️ 請先在 Streamlit 後台 (Secrets) 設定您的 GEMINI_API_KEY。"
         
@@ -64,7 +61,7 @@ def ask_ai_top_3(warrants_list, stock_price, target_type):
 
         prompt = f"""
         你是一位專業的權證操盤手。
-        目前現股價格為 {stock_price} 元，趨勢判斷我們要做【{target_type}】權證。
+        目前現股價格為 {stock_price} 元，我們目前的策略是操作【{target_type}】權證。
         以下是從市場上初步篩選出來的候選名單（已符合天期>60天且價外15%~價內5%）：
         
         {warrant_data_str}
@@ -84,7 +81,7 @@ def ask_ai_top_3(warrants_list, stock_price, target_type):
         - 推薦理由：...
         
         ### ⚠️ 實戰最後叮嚀
-        (提醒使用者：帶著這三檔代號去券商APP，務必檢查「買賣價差是否過大」與「是否有掛出百張以上的造市買賣單」)
+        (提醒使用者：帶著這三檔代號去券商APP，務必檢查「買賣價差是否過大」與「是否有掛出穩定的造市單」)
         """
 
         response = client.models.generate_content(
@@ -97,18 +94,21 @@ def ask_ai_top_3(warrants_list, stock_price, target_type):
 
 # ================= 網頁主程式 =================
 st.title("🎯 頂級造市商【權證全自動篩選器】雲端版")
-st.markdown("嚴格遵守 4 大鐵則：**20MA趨勢、價內外15%~5%、天期>60天、優質造市商**。")
+st.markdown("嚴格遵守 4 大鐵則：**趨勢判定、價內外15%~5%、天期>60天、優質造市商**。")
 
-# 1. 檔案上傳區塊 (雲端版核心改變)
-uploaded_file = st.file_uploader("📂 請上傳證交所的每日權證大表 (warrantStock.csv)", type=["csv", "xls", "xlsx"])
+# 1. 檔案上傳區塊
+uploaded_file = st.file_uploader("📂 請上傳證交所的每日權證大表 (warrantStock.csv 或 xls)", type=["csv", "xls", "xlsx"])
 
 # 2. 搜尋條件區塊
-col1, col2, col3 = st.columns([2, 2, 1])
+col1, col2, col3, col4 = st.columns([1.5, 1.5, 1.5, 1.5])
 with col1:
-    target_code = st.text_input("👉 請輸入現股代號 (例如: 2317 或 2330)", max_chars=6)
+    target_code = st.text_input("👉 現股代號 (如 2330)", max_chars=6)
 with col2:
-    target_issuer = st.selectbox("🏦 請選擇目標發行券商", ["全部", "群益", "凱基", "元大", "富邦", "統一"])
+    target_issuer = st.selectbox("🏦 發行券商", ["全部", "群益", "凱基", "元大", "富邦", "統一"])
 with col3:
+    # ✨ 全新加入：多空強制切換器
+    target_strategy = st.selectbox("🧭 策略方向", ["🤖 AI 自動判定 (依20MA)", "📈 強制找【認購】", "📉 強制找【認售】"])
+with col4:
     st.markdown("<br>", unsafe_allow_html=True) 
     search_btn = st.button("🚀 篩選黃金權證", use_container_width=True)
 
@@ -122,7 +122,6 @@ if search_btn:
         st.warning("⚠️ 請輸入正確的股票代號！")
     else:
         with st.spinner("正在讀取檔案與計算均線..."):
-            # 讀取使用者上傳的檔案
             try:
                 if uploaded_file.name.endswith('.csv'):
                     try:
@@ -144,22 +143,34 @@ if search_btn:
                     st.error("❌ 找不到現貨報價。")
                     st.session_state.warrant_search_done = False
                 else:
-                    is_bull = stock_price > ma20
-                    target_type = "認購" if is_bull else "認售"
+                    # ✨ 核心邏輯：判斷真實均線趨勢
+                    is_bull_ma20 = stock_price > ma20
+                    
+                    # 根據使用者的「策略方向」來決定程式要做多還是做空
+                    if target_strategy == "🤖 AI 自動判定 (依20MA)":
+                        is_bull_trade = is_bull_ma20
+                        target_type = "認購" if is_bull_trade else "認售"
+                    elif target_strategy == "📈 強制找【認購】":
+                        is_bull_trade = True
+                        target_type = "認購"
+                    elif target_strategy == "📉 強制找【認售】":
+                        is_bull_trade = False
+                        target_type = "認售"
                     
                     passed_warrants = []
                     for index, row in warrants_df.iterrows():
                         underlying = str(row.get('標的代號', '')).strip()
                         if underlying != code: continue
                             
-                        # 處理特殊字串 ="066477"
                         w_code = str(row.get('權證代號', '')).strip().replace('="', '').replace('"', '')
                         w_name = str(row.get('權證簡稱', '')).strip()
                         w_type = str(row.get('權證類型', '')).strip()
                         
                         if target_issuer != "全部" and target_issuer not in w_name: continue
-                        if is_bull and '購' not in w_type: continue
-                        if not is_bull and '售' not in w_type: continue
+                        
+                        # 依照決定的策略 (is_bull_trade) 來篩選認購或認售
+                        if is_bull_trade and '購' not in w_type: continue
+                        if not is_bull_trade and '售' not in w_type: continue
                             
                         end_date = str(row.get('最後交易日', '')).strip()
                         days_left = calculate_days_left(end_date)
@@ -171,8 +182,11 @@ if search_btn:
                             if strike_price <= 0: continue 
                         except: continue 
                             
-                        if is_bull: moneyness = (stock_price - strike_price) / strike_price * 100
-                        else:       moneyness = (strike_price - stock_price) / strike_price * 100
+                        # 認購與認售的價內外計算公式不同
+                        if is_bull_trade: # 認購：(現價-履約價)/履約價
+                            moneyness = (stock_price - strike_price) / strike_price * 100
+                        else:             # 認售：(履約價-現價)/履約價
+                            moneyness = (strike_price - stock_price) / strike_price * 100
                             
                         if -15 <= moneyness <= 5:
                             ratio = str(row.get('行使比例', 'N/A')).strip()
@@ -190,9 +204,10 @@ if search_btn:
                     st.session_state.passed_warrants = passed_warrants
                     st.session_state.stock_price = stock_price
                     st.session_state.ma20 = ma20
+                    st.session_state.is_bull_ma20 = is_bull_ma20
                     st.session_state.target_type = target_type
                     st.session_state.target_issuer = target_issuer
-                    st.session_state.is_bull = is_bull
+                    st.session_state.target_strategy = target_strategy
 
 # ----------------- 階段 2：顯示結果與 AI 按鈕 -----------------
 if st.session_state.warrant_search_done:
@@ -200,7 +215,13 @@ if st.session_state.warrant_search_done:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("目前現股價", f"{st.session_state.stock_price} 元")
     m2.metric("20MA (月線)", f"{st.session_state.ma20} 元")
-    m3.metric("趨勢判定", "多頭 (站上月線)" if st.session_state.is_bull else "空頭 (跌破月線)", delta="應買認購" if st.session_state.is_bull else "-應買認售")
+    
+    # 動態顯示趨勢與策略
+    trend_text = "多頭 (站上月線)" if st.session_state.is_bull_ma20 else "空頭 (跌破月線)"
+    if st.session_state.target_strategy != "🤖 AI 自動判定 (依20MA)":
+        trend_text += " (手動強制改變方向)"
+        
+    m3.metric("趨勢判定", trend_text, delta=f"尋找【{st.session_state.target_type}】" if st.session_state.target_type == "認購" else f"-尋找【{st.session_state.target_type}】")
     m4.metric("目標發行商", st.session_state.target_issuer)
     st.markdown("---")
 
@@ -219,4 +240,4 @@ if st.session_state.warrant_search_done:
                 ai_report = ask_ai_top_3(st.session_state.passed_warrants, st.session_state.stock_price, st.session_state.target_type)
                 st.info(ai_report)
     else:
-        st.warning("您上傳的檔案中，沒有符合條件的標的。")
+        st.warning(f"您上傳的檔案中，沒有符合【{st.session_state.target_type}】條件的標的。")
